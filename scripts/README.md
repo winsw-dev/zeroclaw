@@ -17,7 +17,7 @@ This directory contains everything needed to cross-compile ZeroClaw and deploy i
 
 ### Cross-compilation toolchain (pick one)
 
-**Option A — cargo-zigbuild (recommended for Apple Silicon)**
+#### Option A — cargo-zigbuild (recommended for Apple Silicon)
 
 ```bash
 brew install zig
@@ -25,7 +25,7 @@ cargo install cargo-zigbuild
 rustup target add aarch64-unknown-linux-gnu
 ```
 
-**Option B — cross (Docker-based)**
+#### Option B — cross (Docker-based)
 
 ```bash
 cargo install cross
