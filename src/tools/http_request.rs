@@ -2,11 +2,16 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
+///
+/// Optionally resolves auth credentials from `SecretStore` via the `auth_secret`
+/// parameter, so API keys never appear in plaintext in the conversation.
 pub struct HttpRequestTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
@@ -14,6 +19,14 @@ pub struct HttpRequestTool {
     allowed_private_hosts: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    allow_private_hosts: bool,
+    /// Path to `config.toml` for lazy re-read of secrets at execution time.
+    /// `None` when constructed via the legacy `new()` constructor (no secret support).
+    config_path: Option<PathBuf>,
+    /// Whether secret encryption is enabled (needed to create a `SecretStore`).
+    secrets_encrypt: bool,
+    /// Boot-time snapshot of `[http_request.secrets]`.
+    boot_secrets: HashMap<String, String>,
 }
 
 impl HttpRequestTool {
@@ -32,6 +45,113 @@ impl HttpRequestTool {
             allowed_private_hosts: normalize_allowed_domains(allowed_private_hosts),
             max_response_size,
             timeout_secs,
+            allow_private_hosts: false,
+            config_path: None,
+            secrets_encrypt: false,
+            boot_secrets: HashMap::new(),
+        }
+    }
+
+    /// Create with config-reload and SecretStore decryption support.
+    pub fn new_with_config(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        blocked_domains: Vec<String>,
+        allowed_private_hosts: Vec<String>,
+        max_response_size: usize,
+        timeout_secs: u64,
+        allow_private_hosts: bool,
+        config_path: PathBuf,
+        secrets_encrypt: bool,
+        secrets: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            security,
+            allowed_domains: normalize_allowed_domains(allowed_domains),
+            blocked_domains: normalize_allowed_domains(blocked_domains),
+            allowed_private_hosts: normalize_allowed_domains(allowed_private_hosts),
+            max_response_size,
+            timeout_secs,
+            allow_private_hosts,
+            config_path: Some(config_path),
+            secrets_encrypt,
+            boot_secrets: secrets,
+        }
+    }
+
+    /// Validate that a secret name contains only safe characters.
+    fn validate_secret_name(name: &str) -> anyhow::Result<()> {
+        if name.is_empty() || name.len() > 64 {
+            anyhow::bail!("Secret name must be 1-64 characters, got {}", name.len());
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!(
+                "Secret name must contain only alphanumeric, underscore, or hyphen characters"
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolve a named auth secret, preferring the boot-time value but falling
+    /// back to a fresh config read + decryption when necessary.
+    fn resolve_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
+        Self::validate_secret_name(secret_name)?;
+
+        // Fast path: boot-time secret is present and not an encrypted blob.
+        if let Some(value) = self.boot_secrets.get(secret_name) {
+            if !value.is_empty() && !crate::security::SecretStore::is_encrypted(value) {
+                return Ok(value.clone());
+            }
+        }
+        // Slow path: re-read config.toml to pick up keys set/rotated after boot.
+        self.reload_auth_secret(secret_name)
+    }
+
+    /// Re-read `config.toml` and decrypt the named secret from `[http_request.secrets]`.
+    fn reload_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
+        let config_path = self.config_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("auth_secret requires config path (use new_with_config constructor)")
+        })?;
+
+        let contents = std::fs::read_to_string(config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read config file {} for auth secret '{}': {e}",
+                config_path.display(),
+                secret_name,
+            )
+        })?;
+
+        let config: crate::config::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse config file {} for auth secret '{}': {e}",
+                config_path.display(),
+                secret_name,
+            )
+        })?;
+
+        let raw = config
+            .http_request
+            .secrets
+            .get(secret_name)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Secret '{secret_name}' not found in [http_request.secrets]")
+            })?
+            .clone();
+
+        if crate::security::SecretStore::is_encrypted(&raw) {
+            let zeroclaw_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("Secret '{secret_name}' decrypted to empty value");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw)
         }
     }
 
@@ -63,9 +183,11 @@ impl HttpRequestTool {
             anyhow::bail!("Host '{host}' is in http_request.blocked_domains");
         }
 
-        // Check if private host is allowed
-        let private_host_allowed =
-            is_private_or_local_host(&host) && host_matches_allowlist(&host, &self.allowed_private_hosts);
+        // Check if private host is allowed — either via the blanket `allow_private_hosts`
+        // boolean or via the granular `allowed_private_hosts` allowlist.
+        let private_host_allowed = is_private_or_local_host(&host)
+            && (self.allow_private_hosts
+                || host_matches_allowlist(&host, &self.allowed_private_hosts));
 
         if is_private_or_local_host(&host) && !private_host_allowed {
             anyhow::bail!(
@@ -217,6 +339,10 @@ impl Tool for HttpRequestTool {
                 "body": {
                     "type": "string",
                     "description": "Optional request body (for POST, PUT, PATCH requests)"
+                },
+                "auth_secret": {
+                    "type": "string",
+                    "description": "Name of a secret from [http_request.secrets] config to use as the Authorization header value. Avoids passing credentials in plaintext."
                 }
             },
             "required": ["url"]
@@ -271,7 +397,33 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let request_headers = self.parse_headers(&headers_val);
+        let mut request_headers = self.parse_headers(&headers_val);
+
+        // Resolve auth_secret if provided — injects Authorization header
+        // from SecretStore so the key never appears in the conversation.
+        if let Some(secret_name) = args.get("auth_secret").and_then(|v| v.as_str()) {
+            let auth_value = match self.resolve_auth_secret(secret_name) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to resolve auth_secret '{secret_name}': {e}"
+                        )),
+                    });
+                }
+            };
+            // auth_secret overrides any explicit Authorization header
+            if request_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            {
+                tracing::warn!("http_request: auth_secret overrides explicit Authorization header");
+                request_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+            }
+            request_headers.push(("Authorization".to_string(), auth_value));
+        }
 
         match self
             .execute_request(&url, method, request_headers, body)
@@ -610,7 +762,7 @@ fn test_tool_with_private(
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(security, vec![], vec![], vec![], 1_000_000, 30);
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -726,7 +878,7 @@ fn test_tool_with_private(
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], vec![], vec![], 1_000_000, 30);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -741,7 +893,7 @@ fn test_tool_with_private(
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], vec![], vec![], 1_000_000, 30);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -762,9 +914,10 @@ fn test_tool_with_private(
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
+            vec![],
+            vec![],
             10,
             30,
-            false,
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -777,9 +930,10 @@ fn test_tool_with_private(
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
+            vec![],
+            vec![],
             0, // max_response_size = 0 means no limit
             30,
-            false,
         );
         let text = "a".repeat(10_000_000);
         assert_eq!(tool.truncate_response(&text), text);
@@ -790,9 +944,10 @@ fn test_tool_with_private(
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
+            vec![],
+            vec![],
             5,
             30,
-            false,
         );
         let text = "hello world";
         let truncated = tool.truncate_response(text);
@@ -995,6 +1150,27 @@ fn test_tool_with_private(
 
     // ── allow_private_hosts opt-in tests ────────────────────────
 
+    /// Helper: create a tool with the blanket `allow_private_hosts` boolean set.
+    fn test_tool_with_bool_private(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+    ) -> HttpRequestTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let mut tool = HttpRequestTool::new(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            vec![],
+            vec![],
+            1_000_000,
+            30,
+        );
+        tool.allow_private_hosts = allow_private_hosts;
+        tool
+    }
+
     #[test]
     fn default_blocks_private_hosts() {
         let tool = test_tool(vec!["localhost", "192.168.1.5", "*"]);
@@ -1020,19 +1196,19 @@ fn test_tool_with_private(
 
     #[test]
     fn allow_private_hosts_permits_localhost() {
-        let tool = test_tool_with_private(vec!["localhost"], true);
+        let tool = test_tool_with_bool_private(vec!["localhost"], true);
         assert!(tool.validate_url("https://localhost:8080").is_ok());
     }
 
     #[test]
     fn allow_private_hosts_permits_private_ipv4() {
-        let tool = test_tool_with_private(vec!["192.168.1.5"], true);
+        let tool = test_tool_with_bool_private(vec!["192.168.1.5"], true);
         assert!(tool.validate_url("https://192.168.1.5").is_ok());
     }
 
     #[test]
     fn allow_private_hosts_permits_rfc1918_with_wildcard() {
-        let tool = test_tool_with_private(vec!["*"], true);
+        let tool = test_tool_with_bool_private(vec!["*"], true);
         assert!(tool.validate_url("https://10.0.0.1").is_ok());
         assert!(tool.validate_url("https://172.16.0.1").is_ok());
         assert!(tool.validate_url("https://192.168.1.1").is_ok());
@@ -1041,7 +1217,7 @@ fn test_tool_with_private(
 
     #[test]
     fn allow_private_hosts_still_requires_allowlist() {
-        let tool = test_tool_with_private(vec!["example.com"], true);
+        let tool = test_tool_with_bool_private(vec!["example.com"], true);
         let err = tool
             .validate_url("https://192.168.1.5")
             .unwrap_err()
@@ -1054,12 +1230,120 @@ fn test_tool_with_private(
 
     #[test]
     fn allow_private_hosts_false_still_blocks() {
-        let tool = test_tool_with_private(vec!["*"], false);
+        let tool = test_tool_with_bool_private(vec!["*"], false);
         assert!(
             tool.validate_url("https://localhost:8080")
                 .unwrap_err()
                 .to_string()
                 .contains("local/private")
         );
+    }
+
+    // ── auth_secret / SecretStore integration tests ──────────────
+
+    fn test_tool_with_secrets(secrets: HashMap<String, String>) -> HttpRequestTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        HttpRequestTool::new_with_config(
+            security,
+            vec!["example.com".into()],
+            vec![],
+            vec![],
+            1_000_000,
+            30,
+            false,
+            PathBuf::from("/nonexistent/config.toml"),
+            false,
+            secrets,
+        )
+    }
+
+    #[test]
+    fn resolve_auth_secret_returns_boot_value() {
+        let mut secrets = HashMap::new();
+        secrets.insert("github".into(), "Bearer ghp_test123456".into());
+        let tool = test_tool_with_secrets(secrets);
+        let result = tool.resolve_auth_secret("github").unwrap();
+        assert_eq!(result, "Bearer ghp_test123456");
+    }
+
+    #[test]
+    fn resolve_auth_secret_missing_returns_error() {
+        let tool = test_tool_with_secrets(HashMap::new());
+        let err = tool.resolve_auth_secret("nonexistent").unwrap_err();
+        assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn resolve_auth_secret_empty_value_falls_through() {
+        let mut secrets = HashMap::new();
+        secrets.insert("github".into(), String::new());
+        let tool = test_tool_with_secrets(secrets);
+        // Empty boot value triggers reload, which fails because config_path doesn't exist
+        let err = tool.resolve_auth_secret("github").unwrap_err();
+        assert!(err.to_string().contains("config file"));
+    }
+
+    #[test]
+    fn resolve_auth_secret_rejects_invalid_name() {
+        let tool = test_tool_with_secrets(HashMap::new());
+        let err = tool.resolve_auth_secret("").unwrap_err();
+        assert!(err.to_string().contains("1-64"));
+
+        let err = tool.resolve_auth_secret("has spaces").unwrap_err();
+        assert!(err.to_string().contains("alphanumeric"));
+
+        let err = tool.resolve_auth_secret("../traversal").unwrap_err();
+        assert!(err.to_string().contains("alphanumeric"));
+
+        // Valid names should not fail validation (may fail on missing secret)
+        let err = tool.resolve_auth_secret("my_key-01").unwrap_err();
+        assert!(!err.to_string().contains("alphanumeric"));
+    }
+
+    #[test]
+    fn legacy_constructor_returns_error_on_auth_secret() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            vec![],
+            vec![],
+            1_000_000,
+            30,
+        );
+        let err = tool.resolve_auth_secret("any_key").unwrap_err();
+        assert!(err.to_string().contains("new_with_config"));
+    }
+
+    #[test]
+    fn new_with_config_preserves_all_fields() {
+        let mut secrets = HashMap::new();
+        secrets.insert("test".into(), "val".into());
+        let tool = HttpRequestTool::new_with_config(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            vec![],
+            vec![],
+            500,
+            15,
+            false,
+            PathBuf::from("/tmp/config.toml"),
+            true,
+            secrets,
+        );
+        assert_eq!(tool.max_response_size, 500);
+        assert_eq!(tool.timeout_secs, 15);
+        assert!(tool.secrets_encrypt);
+        assert_eq!(tool.config_path, Some(PathBuf::from("/tmp/config.toml")));
+        assert_eq!(tool.boot_secrets.get("test").unwrap(), "val");
+    }
+
+    #[test]
+    fn schema_includes_auth_secret_parameter() {
+        let tool = test_tool(vec!["example.com"]);
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["auth_secret"].is_object());
     }
 }

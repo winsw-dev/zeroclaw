@@ -119,8 +119,6 @@ export interface ChannelDetail {
   type: string;
   enabled: boolean;
   status: 'active' | 'inactive' | 'error';
-  message_count: number;
-  last_message_at: string | null;
   health: 'healthy' | 'degraded' | 'down';
 }
 
@@ -128,6 +126,11 @@ export interface SSEEvent {
   type: string;
   timestamp?: string;
   [key: string]: any;
+}
+
+export interface SessionMessage {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
 export interface WsMessage {
@@ -151,10 +154,10 @@ export interface WsMessage {
   output?: string;
   message?: string;
   code?: string;
-  role?: string;
   session_id?: string;
   resumed?: boolean;
   message_count?: number;
+  role?: string;
 }
 
 /** Row from GET /api/sessions/{id}/messages */
@@ -167,4 +170,5 @@ export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessageRow[];
   session_persistence: boolean;
+  has_more?: boolean;
 }
