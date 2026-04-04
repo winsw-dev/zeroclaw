@@ -1,3 +1,6 @@
 node_modules/
 dist/*
 !dist/.gitkeep
+
+# Per-locale JSON files are generated from src/lib/translations.json at build time
+src/lib/locales/

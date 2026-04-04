@@ -5,9 +5,9 @@
   "license": "(MIT OR Apache-2.0)",
   "type": "module",
   "scripts": {
-    "build": "node scripts/generate-i18n-types.mjs && tsc -b && vite build",
-    "dev": "vite",
-    "i18n:types": "node scripts/generate-i18n-types.mjs"
+    "build": "node scripts/generate-locales.mjs && node scripts/generate-i18n-types.mjs && tsc -b && vite build",
+    "dev": "node scripts/generate-locales.mjs && vite",
+    "i18n:generate": "node scripts/generate-locales.mjs && node scripts/generate-i18n-types.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

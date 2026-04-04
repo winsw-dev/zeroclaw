@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Generates TypeScript type for translation keys from the English locale file.
+ * Generates TypeScript type for translation keys from translations.json.
  * Run: node web/scripts/generate-i18n-types.mjs
  */
 
@@ -9,11 +9,11 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const enPath = resolve(__dirname, '../src/lib/locales/en.json');
+const srcPath = resolve(__dirname, '../src/lib/translations.json');
 const outPath = resolve(__dirname, '../src/lib/i18n-keys.ts');
 
-const en = JSON.parse(readFileSync(enPath, 'utf-8'));
-const keys = Object.keys(en).sort();
+const data = JSON.parse(readFileSync(srcPath, 'utf-8'));
+const keys = Object.keys(data.en).sort();
 
 const union = keys.map((k) => `  | '${k}'`).join('\n');
 
