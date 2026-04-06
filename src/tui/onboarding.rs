@@ -787,12 +787,6 @@ pub async fn run_tui_onboarding() -> Result<()> {
                 }
                 println!("  Run `zeroclaw daemon` to start your agent.");
                 println!();
-
-                // Auto-start channels flag — match CLI wizard behavior
-                if channel != "Skip for now" {
-                    // SAFETY: called during single-threaded post-wizard flow.
-                    unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
-                }
             }
             Err(e) => {
                 eprintln!();
