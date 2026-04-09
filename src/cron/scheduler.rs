@@ -5,8 +5,8 @@ use crate::channels::MatrixChannel;
 #[cfg(feature = "whatsapp-web")]
 use crate::channels::WhatsAppWebChannel;
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, QQChannel, SendMessage, SignalChannel,
-    SlackChannel, TelegramChannel,
+    Channel, DiscordChannel, EmailChannel, MattermostChannel, QQChannel, SendMessage,
+    SignalChannel, SlackChannel, TelegramChannel,
 };
 use crate::config::Config;
 use crate::config::schema::{CronJobDecl, CronScheduleDecl};
@@ -707,6 +707,17 @@ pub(crate) async fn deliver_announcement(
             {
                 anyhow::bail!("feishu delivery channel requires `channel-lark` feature");
             }
+        }
+        "email" => {
+            let em = config
+                .channels_config
+                .email
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("email channel not configured"))?;
+            let channel = EmailChannel::new(em.clone());
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
