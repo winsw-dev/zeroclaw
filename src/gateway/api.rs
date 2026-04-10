@@ -2317,7 +2317,7 @@ mod tests {
             enabled: true,
             bot_token: "test-token".to_string(),
             allowed_users: vec!["*".to_string()],
-            stream_mode: Default::default(),
+            stream_mode: crate::config::schema::StreamMode::default(),
             draft_update_interval_ms: 1500,
             interrupt_on_new_message: false,
             mention_only: false,
