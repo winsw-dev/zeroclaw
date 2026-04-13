@@ -103,15 +103,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # URL encoding for web search
 urlencoding = "2.1"
 
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
-
-rumqttc = "0.24"
 
 # Tarball extraction for binary updates
 flate2 = "1"
