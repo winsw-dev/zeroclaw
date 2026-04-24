@@ -95,15 +95,19 @@ pub fn set_desktop_setting(app: tauri::AppHandle, key: String, value: bool) -> R
 /// Toggle the gateway on/off. Returns the new active state.
 #[tauri::command]
 pub async fn toggle_gateway(state: State<'_, SharedState>) -> Result<bool, String> {
-    let (url, connected) = {
+    let (url, token, connected) = {
         let s = state.read().await;
-        (s.gateway_url.clone(), s.connected)
+        (s.gateway_url.clone(), s.token.clone(), s.connected)
     };
 
     if connected {
-        // Send shutdown to the gateway.
+        // Send authenticated shutdown to the gateway.
         let client = reqwest::Client::new();
-        let _ = client.post(format!("{url}/admin/shutdown")).send().await;
+        let mut req = client.post(format!("{url}/admin/shutdown"));
+        if let Some(ref t) = token {
+            req = req.bearer_auth(t);
+        }
+        let _ = req.send().await;
         {
             let mut s = state.write().await;
             s.connected = false;

@@ -269,7 +269,15 @@ pub struct NodePersistence {
 impl NodePersistence {
     pub fn new(workspace_dir: &Path) -> Self {
         let db_path = workspace_dir.join("devices.db");
-        let conn = Connection::open(&db_path).expect("Failed to open node persistence database");
+        if let Err(e) = Self::init_db(&db_path) {
+            tracing::error!("Failed to initialize node persistence database: {e}");
+        }
+        Self { db_path }
+    }
+
+    fn init_db(db_path: &Path) -> rusqlite::Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS nodes (
                 node_id TEXT PRIMARY KEY,
@@ -279,13 +287,18 @@ impl NodePersistence {
                 registered_at TEXT NOT NULL,
                 linked_device_id TEXT
             )",
-        )
-        .expect("Failed to create nodes table");
-        Self { db_path }
+        )?;
+        Ok(())
     }
 
-    fn open_db(&self) -> Connection {
-        Connection::open(&self.db_path).expect("Failed to open node persistence database")
+    fn open_db(&self) -> Option<Connection> {
+        match Connection::open(&self.db_path) {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                tracing::error!("Failed to open node persistence database: {e}");
+                None
+            }
+        }
     }
 
     pub fn persist_node(
@@ -295,10 +308,10 @@ impl NodePersistence {
         capabilities: &[NodeCapability],
         linked_device_id: Option<&str>,
     ) {
-        let conn = self.open_db();
+        let Some(conn) = self.open_db() else { return };
         let caps_json = serde_json::to_string(capabilities).unwrap_or_else(|_| "[]".into());
         let now = Utc::now().to_rfc3339();
-        conn.execute(
+        if let Err(e) = conn.execute(
             "INSERT INTO nodes (node_id, device_type, capabilities_json, last_seen, registered_at, linked_device_id)
              VALUES (?1, ?2, ?3, ?4, ?4, ?5)
              ON CONFLICT(node_id) DO UPDATE SET
@@ -307,12 +320,13 @@ impl NodePersistence {
                 last_seen = ?4,
                 linked_device_id = COALESCE(?5, linked_device_id)",
             rusqlite::params![node_id, device_type, caps_json, now, linked_device_id],
-        )
-        .expect("Failed to persist node");
+        ) {
+            tracing::error!("Failed to persist node {node_id}: {e}");
+        }
     }
 
     pub fn update_last_seen(&self, node_id: &str) {
-        let conn = self.open_db();
+        let Some(conn) = self.open_db() else { return };
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE nodes SET last_seen = ?1 WHERE node_id = ?2",
@@ -322,43 +336,57 @@ impl NodePersistence {
     }
 
     pub fn list_persisted_nodes(&self) -> Vec<PersistedNodeInfo> {
-        let conn = self.open_db();
-        let mut stmt = conn
+        let Some(conn) = self.open_db() else {
+            return Vec::new();
+        };
+        let mut stmt = match conn
             .prepare("SELECT node_id, device_type, capabilities_json, last_seen, registered_at, linked_device_id FROM nodes")
-            .expect("Failed to prepare node select");
-        let rows = stmt
-            .query_map([], |row| {
-                let node_id: String = row.get(0)?;
-                let device_type: Option<String> = row.get(1)?;
-                let caps_json: String = row.get(2)?;
-                let last_seen_str: String = row.get(3)?;
-                let registered_at_str: String = row.get(4)?;
-                let linked_device_id: Option<String> = row.get(5)?;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to prepare node select: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([], |row| {
+            let node_id: String = row.get(0)?;
+            let device_type: Option<String> = row.get(1)?;
+            let caps_json: String = row.get(2)?;
+            let last_seen_str: String = row.get(3)?;
+            let registered_at_str: String = row.get(4)?;
+            let linked_device_id: Option<String> = row.get(5)?;
 
-                let capabilities: Vec<NodeCapability> =
-                    serde_json::from_str(&caps_json).unwrap_or_default();
-                let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let registered_at = DateTime::parse_from_rfc3339(&registered_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
+            let capabilities: Vec<NodeCapability> =
+                serde_json::from_str(&caps_json).unwrap_or_default();
+            let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let registered_at = DateTime::parse_from_rfc3339(&registered_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
 
-                Ok(PersistedNodeInfo {
-                    node_id,
-                    device_type,
-                    capabilities,
-                    last_seen,
-                    registered_at,
-                    linked_device_id,
-                })
+            Ok(PersistedNodeInfo {
+                node_id,
+                device_type,
+                capabilities,
+                last_seen,
+                registered_at,
+                linked_device_id,
             })
-            .expect("Failed to query persisted nodes");
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to query persisted nodes: {e}");
+                return Vec::new();
+            }
+        };
         rows.filter_map(|r| r.ok()).collect()
     }
 
     pub fn remove_node(&self, node_id: &str) -> bool {
-        let conn = self.open_db();
+        let Some(conn) = self.open_db() else {
+            return false;
+        };
         let deleted = conn
             .execute(
                 "DELETE FROM nodes WHERE node_id = ?1",
@@ -522,9 +550,17 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
 
     let pending_clone = Arc::clone(&pending);
 
-    // Task to forward invocations to the node via WebSocket
+    // Task to forward invocations (and ack messages) to the node via WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(invocation) = invoke_rx.recv().await {
+            if invocation.capability == "__registered__" {
+                if let serde_json::Value::String(ref json) = invocation.args {
+                    if sender.send(Message::Text(json.clone().into())).await.is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
             let msg = GatewayMessage::Invoke {
                 call_id: invocation.call_id.clone(),
                 capability: invocation.capability,
@@ -584,12 +620,19 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                     tracing::info!("Node registered: {node_id} with {caps_count} capabilities");
                     registered_node_id = Some(node_id.clone());
 
-                    // Send ack — we can't use `sender` here since it's moved
-                    // into the send task. Instead, send ack via the invoke channel
-                    // pattern isn't ideal. We'll use a workaround: send the ack
-                    // through a special invocation that the send task converts to
-                    // a registered message. For simplicity, we just log and the
-                    // ack is implicit in the protocol.
+                    let ack = GatewayMessage::Registered {
+                        node_id: node_id.clone(),
+                        capabilities_count: caps_count,
+                    };
+                    if let Ok(json) = serde_json::to_string(&ack) {
+                        let ack_inv = NodeInvocation {
+                            call_id: "__ack__".into(),
+                            capability: "__registered__".into(),
+                            args: serde_json::Value::String(json),
+                            response_tx: tokio::sync::oneshot::channel().0,
+                        };
+                        let _ = invoke_tx.send(ack_inv).await;
+                    }
                 } else {
                     tracing::warn!(
                         "Node registration rejected: registry at capacity for {node_id}"

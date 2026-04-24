@@ -7,6 +7,7 @@
 use crate::state::SharedState;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const NODE_ID: &str = "desktop-local";
@@ -304,12 +305,17 @@ async fn run_node_connection(state: &SharedState) -> anyhow::Result<()> {
     let ws_url = gateway_url
         .replace("http://", "ws://")
         .replace("https://", "wss://");
-    let mut url = format!("{ws_url}/ws/nodes");
+    let url = format!("{ws_url}/ws/nodes");
+
+    let mut request = url.into_client_request()?;
     if let Some(ref t) = token {
-        url.push_str(&format!("?token={t}"));
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {t}").parse().unwrap_or_default(),
+        );
     }
 
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(request).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Send registration.

@@ -22,7 +22,7 @@ pub struct ScreenCaptureResult {
 /// Capture the screen (or a region) and return the image as base64 PNG.
 #[tauri::command]
 pub async fn capture_screen(region: Option<ScreenRegion>) -> Result<ScreenCaptureResult, String> {
-    let tmp = std::env::temp_dir().join(format!("zeroclaw_screenshot_{}.png", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("zeroclaw_screenshot_{}.png", uuid::Uuid::new_v4()));
     let tmp_str = tmp.to_string_lossy().to_string();
 
     let mut cmd = Command::new("screencapture");

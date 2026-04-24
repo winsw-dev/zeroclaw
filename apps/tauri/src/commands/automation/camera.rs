@@ -8,7 +8,7 @@ use tokio::process::Command;
 /// Tries `imagesnap` first (commonly available), falls back to `ffmpeg`.
 #[tauri::command]
 pub async fn capture_photo() -> Result<String, String> {
-    let tmp = std::env::temp_dir().join(format!("zeroclaw_camera_{}.jpg", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("zeroclaw_camera_{}.jpg", uuid::Uuid::new_v4()));
     let tmp_str = tmp.to_string_lossy().to_string();
 
     // Try imagesnap first.
