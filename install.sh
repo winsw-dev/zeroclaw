@@ -79,7 +79,7 @@ list_features() {
 
   printf "  %s\n" "$(bold "Build profiles:")"
   printf "    %s                                        # full (default features)\n" "$0"
-  printf "    %s --minimal                              # kernel only (~6.6MB)\n" "$0"
+  printf "    %s --minimal                              # kernel only (~5.1MB)\n" "$0"
   printf "    %s --minimal --features agent-runtime,channel-discord\n" "$0"
   echo
 }
